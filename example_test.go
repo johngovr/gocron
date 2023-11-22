@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/go-co-op/gocron"
+	"github.com/johngovr/gocron"
 )
 
 var task = func() {}

@@ -2,6 +2,8 @@ package gocron
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +37,8 @@ const (
 	WaitMode
 )
 
+var limitModeRfCounter = *atomic.NewInt64(0)
+
 type executor struct {
 	jobFunctions  chan jobFunction   // the chan upon which the jobFunctions are passed in from the scheduler
 	ctx           context.Context    // used to tell the executor to stop
@@ -55,6 +59,69 @@ type executor struct {
 
 	distributedLocker  Locker  // support running jobs across multiple instances
 	distributedElector Elector // support running jobs across multiple instances
+
+	// limitModeRfCount    *atomic.Int64 // runnint function counter
+	limitModeQueueStore *jbfStore // store jobFunction in list
+}
+
+type jbfStore struct {
+	jbfs []*jobFunction // job function slice
+	len  int            // number
+}
+
+func newJbfStore() *jbfStore {
+	rst := &jbfStore{
+		len:  0,
+		jbfs: make([]*jobFunction, 0),
+	}
+	return rst
+}
+func (s *jbfStore) Len() int { return s.len }
+
+// only save nameed job
+func (s *jbfStore) Store(jbf *jobFunction) {
+	fmt.Println(" store job function name : ", jbf.jobName)
+	if fj := s.Find(jbf.jobName); fj == nil {
+		s.jbfs = append(s.jbfs, jbf)
+		s.len++
+	}
+}
+
+func (s *jbfStore) Find(name string) *jobFunction {
+	var rst *jobFunction = nil
+	for _, j := range s.jbfs {
+		if strings.EqualFold(name, j.jobName) {
+			fmt.Println(" find job function name ok :", name)
+			rst = j
+			break
+		}
+	}
+	return rst
+}
+
+// pick one highest priority job function
+func (s *jbfStore) Pick() *jobFunction {
+	var rst *jobFunction = nil
+	var fj, p int = 0, -1
+
+	for i, jbf := range s.jbfs {
+		if jbf.priority > p {
+			fj = i
+			rst = jbf
+			p = jbf.priority
+		}
+	}
+	if rst != nil {
+		s.jbfs = append(s.jbfs[0:fj], s.jbfs[fj+1:]...)
+		s.len = len(s.jbfs)
+	}
+	if rst != nil {
+		fmt.Println(" pick job function name :", rst.jobName)
+	} else {
+		fmt.Println(" not find job function in the store.")
+	}
+
+	return rst
 }
 
 func newExecutor() executor {
@@ -65,11 +132,17 @@ func newExecutor() executor {
 		limitModeFuncWg:       &sync.WaitGroup{},
 		limitModeRunningJobs:  atomic.NewInt64(0),
 		limitModeQueueMu:      &sync.Mutex{},
+
+		limitModeQueueStore: newJbfStore(),
 	}
 	return e
 }
 
 func runJob(f jobFunction) {
+	defer traceMsg(" runJob :" + f.jobName)()
+	limitModeRfCounter.Inc()
+	defer limitModeRfCounter.Dec()
+
 	panicHandlerMutex.RLock()
 	defer panicHandlerMutex.RUnlock()
 
@@ -97,6 +170,8 @@ func runJob(f jobFunction) {
 }
 
 func (jf *jobFunction) singletonRunner() {
+	defer traceMsg(" job function singletonRunner, jobName:" + jf.jobName)() // .jobName)() //jf.getName())()
+
 	jf.singletonRunnerOn.Store(true)
 	jf.singletonWgMu.Lock()
 	jf.singletonWg.Add(1)
@@ -104,6 +179,8 @@ func (jf *jobFunction) singletonRunner() {
 	for {
 		select {
 		case <-jf.ctx.Done():
+			logMsg(" singletonRunner -> : <-jf.ctx.Done() :" + jf.jobName)
+
 			jf.singletonWg.Done()
 			jf.singletonRunnerOn.Store(false)
 			jf.singletonQueueMu.Lock()
@@ -112,7 +189,9 @@ func (jf *jobFunction) singletonRunner() {
 			jf.stopped.Store(false)
 			return
 		case <-jf.singletonQueue:
+			logMsg(" singletonRunner -> : <-jf.singletonQueue :" + jf.jobName)
 			if !jf.stopped.Load() {
+				logMsg(" singletonRunner -> : before call runJob(*jf), jobName:" + jf.jobName)
 				runJob(*jf)
 			}
 		}
@@ -120,17 +199,25 @@ func (jf *jobFunction) singletonRunner() {
 }
 
 func (e *executor) limitModeRunner() {
+	defer traceMsg(" limitModeRunner")()
+
 	for {
 		select {
 		case <-e.ctx.Done():
-			e.limitModeFuncsRunning.Inc()
+			logMsg(" limitModeRunner -> : <-e.ctx.Done()")
+
+			e.limitModeFuncsRunning.Dec() // .Inc() // e.limitModeFuncsRunning.Inc()
 			e.limitModeFuncWg.Done()
 			return
 		case jf := <-e.limitModeQueue:
+			logMsg("  limitModeRunner -> : jf := <-e.limitModeQueue :" + jf.jobName)
+
 			if !e.stopped.Load() {
 				select {
 				case <-jf.ctx.Done():
+					logMsg(" limitModeRunner -> : jf := <-e.limitModeQueue :-> <-jf.ctx.Done() :" + jf.jobName)
 				default:
+					logMsg(" limitModeRunner -> : jf := <-e.limitModeQueue, default: before e.runJob(jf) :" + jf.jobName)
 					e.runJob(jf)
 				}
 			}
@@ -139,6 +226,8 @@ func (e *executor) limitModeRunner() {
 }
 
 func (e *executor) start() {
+	defer traceMsg(" executor start.")()
+
 	e.wg = &sync.WaitGroup{}
 	e.wg.Add(1)
 
@@ -154,10 +243,13 @@ func (e *executor) start() {
 	e.limitModeQueueMu.Lock()
 	e.limitModeQueue = make(chan jobFunction, 1000)
 	e.limitModeQueueMu.Unlock()
+
 	go e.run()
 }
 
 func (e *executor) runJob(f jobFunction) {
+	defer traceMsg(" executor runJob :" + f.jobName)()
+
 	defer func() {
 		if e.limitMode == RescheduleMode && e.limitModeMaxRunningJobs > 0 {
 			e.limitModeRunningJobs.Add(-1)
@@ -212,9 +304,12 @@ func (e *executor) runJob(f jobFunction) {
 		}
 		runJob(f)
 	case singletonMode:
+		logMsg(" executor runJob : -> singleton mode, jobName:" + f.jobName) // f.getName())
+
 		e.singletonWgs.Store(f.singletonWg, f.singletonWgMu)
 
 		if !f.singletonRunnerOn.Load() {
+			logMsg(" executor runJob : -> singleton mode before call f.singletonRunner() :" + f.jobName)
 			go f.singletonRunner()
 		}
 		f.singletonQueueMu.Lock()
@@ -224,19 +319,42 @@ func (e *executor) runJob(f jobFunction) {
 }
 
 func (e *executor) run() {
+	defer traceMsg(" executor run.")()
+	limitModeRfCounter.Store(0)
+
+	trf := func() {
+		if int(limitModeRfCounter.Load()) < e.limitModeMaxRunningJobs {
+			if e.limitModeQueueStore.Len() > 0 {
+				jf := e.limitModeQueueStore.Pick()
+				if jf == nil {
+					return
+				}
+				e.limitModeQueue <- *jf
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}
+	tr := time.AfterFunc(500*time.Millisecond, trf)
+	defer tr.Stop()
+
 	for {
 		select {
 		case f := <-e.jobFunctions:
+			logMsg(" executor run. -> f := <-e.jobFunctions begin :" + f.jobName)
+
 			if e.stopped.Load() || e.skipExecution.Load() {
 				continue
 			}
 
+			// logMsg(" executor run : -> f := <-e.jobFunctions -> e.limitModeMaxRunningJobs > 0 :" + f.jobName)
 			if e.limitModeMaxRunningJobs > 0 {
 				countRunning := e.limitModeFuncsRunning.Load()
 				if countRunning < int64(e.limitModeMaxRunningJobs) {
 					diff := int64(e.limitModeMaxRunningJobs) - countRunning
 					for i := int64(0); i < diff; i++ {
 						e.limitModeFuncWg.Add(1)
+
+						logMsg(" executor run : ->  f := <-e.jobFunctions -> diff :" + fmt.Sprint(diff) + ", before call e.limitModeRunner() :" + f.jobName)
 						go e.limitModeRunner()
 						e.limitModeFuncsRunning.Inc()
 					}
@@ -245,6 +363,8 @@ func (e *executor) run() {
 
 			e.jobsWg.Add(1)
 			go func() {
+				defer traceMsg(" executor run, go func() begin :" + f.jobName)()
+
 				defer e.jobsWg.Done()
 
 				if e.limitModeMaxRunningJobs > 0 {
@@ -253,22 +373,34 @@ func (e *executor) run() {
 						if e.limitModeRunningJobs.Load() < int64(e.limitModeMaxRunningJobs) {
 							select {
 							case e.limitModeQueue <- f:
+								logMsg(" executor run, go func() ->RescheduleMode -> e.limitModeQueue <- f :" + f.jobName)
 								e.limitModeRunningJobs.Inc()
 							case <-e.ctx.Done():
+								logMsg(" executor run, go func() ->RescheduleMode -> <-e.ctx.Done() :" + f.jobName)
 							}
 						}
 					case WaitMode:
-						select {
-						case e.limitModeQueue <- f:
-						case <-e.ctx.Done():
-						}
+						// store the f jobFunction
+						// if running function number less than MaxRunning limit then push jobfunction into queue
+						e.limitModeQueueStore.Store(&f)
+						trf()
+						/*
+							select {
+							case e.limitModeQueue <- f:
+								logMsg(" executor run, go func() ->WaitMode -> e.limitModeQueue <- f :" + f.jobName)
+							case <-e.ctx.Done():
+								logMsg(" executor run, go func() ->WaitMode -> <-e.ctx.Done() :" + f.jobName)
+							}
+						*/
 					}
 					return
 				}
 
+				logMsg(" executor run, go func() before call e.runJob(f) :" + f.jobName)
 				e.runJob(f)
 			}()
 		case <-e.ctx.Done():
+			logMsg(" executor run. -> <-e.ctx.Done()")
 			e.jobsWg.Wait()
 			e.wg.Done()
 			return
@@ -277,6 +409,8 @@ func (e *executor) run() {
 }
 
 func (e *executor) stop() {
+	defer traceMsg(" stopping executor.")()
+
 	e.stopped.Store(true)
 	e.cancel()
 	e.wg.Wait()
@@ -297,5 +431,7 @@ func (e *executor) stop() {
 		e.limitModeQueueMu.Lock()
 		e.limitModeQueue = nil
 		e.limitModeQueueMu.Unlock()
+
+		e.limitModeQueueStore = nil
 	}
 }

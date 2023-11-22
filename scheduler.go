@@ -184,6 +184,12 @@ func (s *Scheduler) Location() *time.Location {
 	return s.location
 }
 
+func (s *Scheduler) Priority(pl int) *Scheduler {
+	job := s.getCurrentJob()
+	job.priority = pl
+	return s
+}
+
 type nextRun struct {
 	duration time.Duration
 	dateTime time.Time
@@ -571,6 +577,8 @@ func (s *Scheduler) Every(interval interface{}) *Scheduler {
 }
 
 func (s *Scheduler) run(job *Job) {
+	defer traceMsg(" scheduling run :" + job.jobName)()
+
 	if !s.IsRunning() {
 		return
 	}
@@ -598,18 +606,24 @@ func (s *Scheduler) run(job *Job) {
 		}
 	}
 
+	logMsg(" scheduler run :" + job.jobName + ", before put function copy to jobFunctions channel")
 	s.executor.jobFunctions <- job.jobFunction.copy()
 }
 
 func (s *Scheduler) runContinuous(job *Job) {
+	defer traceMsg(" scheduling runContinuous :" + job.jobName)()
+
 	shouldRun, next := s.scheduleNextRun(job)
 	if !shouldRun {
 		return
 	}
 
+	logMsg(" runContinuous :" + job.jobName + ", should run.")
+
 	if !job.getStartsImmediately() {
 		job.setStartsImmediately(true)
 	} else {
+		logMsg(" runContinuous :" + job.jobName + ", before call s.run(job)")
 		s.run(job)
 	}
 	nr := next.dateTime.Sub(s.now())
@@ -622,7 +636,10 @@ func (s *Scheduler) runContinuous(job *Job) {
 		nr = next.dateTime.Sub(s.now())
 	}
 
+	logMsg(" runContinuous :" + job.jobName + ", before job.setTimer()")
 	job.setTimer(s.timer(nr, func() {
+		defer traceMsg(" runContinuous :" + job.jobName + ", setTimer func begin")()
+
 		if !next.dateTime.IsZero() {
 			for {
 				n := s.now().UnixNano() - next.dateTime.UnixNano()
@@ -631,10 +648,14 @@ func (s *Scheduler) runContinuous(job *Job) {
 				}
 				select {
 				case <-s.executor.ctx.Done():
+					logMsg(" <-s.executor.ctx.Done() :" + job.jobName)
 				case <-time.After(time.Duration(n)):
+					logMsg(" <-time.After(time.Duration(n)) :" + job.jobName)
 				}
 			}
 		}
+
+		logMsg(" runContinuous in setTimer function before recall runContinuous :" + job.jobName)
 		s.runContinuous(job)
 	}))
 }
@@ -929,6 +950,8 @@ func (s *Scheduler) stopJobs() {
 }
 
 func (s *Scheduler) doCommon(jobFun interface{}, params ...interface{}) (*Job, error) {
+	defer traceMsg(" scheduling doCommon")()
+
 	job := s.getCurrentJob()
 	s.inScheduleChain = nil
 
@@ -1522,4 +1545,26 @@ func (s *Scheduler) RegisterEventListeners(eventListeners ...EventListener) {
 
 func (s *Scheduler) PauseJobExecution(shouldPause bool) {
 	s.executor.skipExecution.Store(shouldPause)
+}
+
+// for tracing execution routines
+func traceMsg(msg string) func() {
+	logMsg(" starting " + msg)
+	tn := time.Now()
+
+	return func() {
+		d1 := time.Now().Sub(tn)
+		logMsg(" finish " + msg + " using " + fmt.Sprint(d1))
+	}
+
+}
+
+var logsync *sync.RWMutex = &sync.RWMutex{}
+
+func logMsg(msg string) {
+	return
+	logsync.RLock()
+	defer logsync.RUnlock()
+
+	fmt.Printf("%s %s\n", time.Now().Format("02 15:04:05.999"), msg)
 }

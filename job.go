@@ -69,6 +69,8 @@ type jobFunction struct {
 	singletonWgMu     *sync.Mutex        // use to protect the singletonWg
 	stopped           *atomic.Bool       // tracks whether the job is currently stopped
 	jobFuncNextRun    time.Time          // the next time the job is scheduled to run
+
+	priority int // (*)the priority level, from 0 to highest
 }
 
 type eventListeners struct {
@@ -107,6 +109,8 @@ func (jf *jobFunction) copy() jobFunction {
 		singletonRunnerOn: jf.singletonRunnerOn,
 		stopped:           jf.stopped,
 		jobFuncNextRun:    jf.jobFuncNextRun,
+
+		priority: jf.priority,
 	}
 	cp.parameters = append(cp.parameters, jf.parameters...)
 	return cp
