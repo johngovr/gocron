@@ -70,7 +70,9 @@ type jobFunction struct {
 	stopped           *atomic.Bool       // tracks whether the job is currently stopped
 	jobFuncNextRun    time.Time          // the next time the job is scheduled to run
 
-	priority int // (*)the priority level, from 0 to highest
+	priority    int         // (*)the priority level, from 0 to highest 10
+	maxLifeTime int         // the maximum millseconds life time for the job to run
+	stopFuntion interface{} // when executing the job timeout call this
 }
 
 type eventListeners struct {
@@ -433,6 +435,12 @@ func (j *Job) RegisterEventListeners(eventListeners ...EventListener) {
 	for _, el := range eventListeners {
 		el(j)
 	}
+
+	// logMsg2(true, fmt.Sprintf("job %s  RegisterEventListeners :%v", j.jobName, j.eventListeners))
+}
+
+func (j *Job) GetEventListeners() eventListeners {
+	return j.eventListeners
 }
 
 // Deprecated: SetEventListeners accepts two functions that will be called, one before and one after the job is run

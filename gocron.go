@@ -101,6 +101,8 @@ func callJobFunc(jobFunc interface{}) {
 }
 
 func callJobFuncWithParams(jobFunc interface{}, params []interface{}) error {
+	defer traceMsg(fmt.Sprintf("call %v, with params :%v", jobFunc, params))()
+
 	if jobFunc == nil {
 		return nil
 	}

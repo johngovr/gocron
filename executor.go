@@ -65,14 +65,16 @@ type executor struct {
 }
 
 type jbfStore struct {
-	jbfs []*jobFunction // job function slice
-	len  int            // number
+	jbfs        []*jobFunction // job function slice
+	len         int            // number
+	storeLocker *sync.RWMutex
 }
 
 func newJbfStore() *jbfStore {
 	rst := &jbfStore{
-		len:  0,
-		jbfs: make([]*jobFunction, 0),
+		len:         0,
+		jbfs:        make([]*jobFunction, 0),
+		storeLocker: &sync.RWMutex{},
 	}
 	return rst
 }
@@ -80,6 +82,9 @@ func (s *jbfStore) Len() int { return s.len }
 
 // only save nameed job
 func (s *jbfStore) Store(jbf *jobFunction) {
+	s.storeLocker.RLock()
+	defer s.storeLocker.RUnlock()
+
 	fmt.Println(" store job function name : ", jbf.jobName)
 	if fj := s.Find(jbf.jobName); fj == nil {
 		s.jbfs = append(s.jbfs, jbf)
@@ -103,6 +108,7 @@ func (s *jbfStore) Find(name string) *jobFunction {
 func (s *jbfStore) Pick() *jobFunction {
 	var rst *jobFunction = nil
 	var fj, p int = 0, -1
+	var sb strings.Builder = strings.Builder{}
 
 	for i, jbf := range s.jbfs {
 		if jbf.priority > p {
@@ -110,13 +116,15 @@ func (s *jbfStore) Pick() *jobFunction {
 			rst = jbf
 			p = jbf.priority
 		}
+
+		sb.WriteString(fmt.Sprintf("%v:%s, ", i, jbf.jobName))
 	}
 	if rst != nil {
 		s.jbfs = append(s.jbfs[0:fj], s.jbfs[fj+1:]...)
 		s.len = len(s.jbfs)
 	}
 	if rst != nil {
-		fmt.Println(" pick job function name :", rst.jobName)
+		fmt.Println(" pick job function name :", rst.jobName, ", from :", sb.String())
 	} else {
 		fmt.Println(" not find job function in the store.")
 	}
@@ -139,7 +147,9 @@ func newExecutor() executor {
 }
 
 func runJob(f jobFunction) {
-	defer traceMsg(" runJob :" + f.jobName)()
+	f.runStartCount.Add(1)
+	f.isRunning.Store(true)
+
 	limitModeRfCounter.Inc()
 	defer limitModeRfCounter.Dec()
 
@@ -153,8 +163,8 @@ func runJob(f jobFunction) {
 			}
 		}()
 	}
-	f.runStartCount.Add(1)
-	f.isRunning.Store(true)
+	defer traceMsg2(" runJob :" + f.jobName)()
+
 	callJobFunc(f.eventListeners.onBeforeJobExecution)
 	_ = callJobFuncWithParams(f.eventListeners.beforeJobRuns, []interface{}{f.getName()})
 	err := callJobFuncWithParams(f.function, f.parameters)
@@ -244,6 +254,8 @@ func (e *executor) start() {
 	e.limitModeQueue = make(chan jobFunction, 1000)
 	e.limitModeQueueMu.Unlock()
 
+	e.limitModeQueueStore = newJbfStore()
+
 	go e.run()
 }
 
@@ -323,24 +335,47 @@ func (e *executor) run() {
 	limitModeRfCounter.Store(0)
 
 	trf := func() {
+		e.limitModeQueueStore.storeLocker.RLock()
+		defer e.limitModeQueueStore.storeLocker.RUnlock()
+
 		if int(limitModeRfCounter.Load()) < e.limitModeMaxRunningJobs {
+			limitModeRfCounter.Add(int64(e.limitModeMaxRunningJobs)) // for stopping the concurrent goroutine when starting runjobfunction time
+			defer limitModeRfCounter.Sub(int64(e.limitModeMaxRunningJobs))
+
 			if e.limitModeQueueStore.Len() > 0 {
 				jf := e.limitModeQueueStore.Pick()
 				if jf == nil {
 					return
 				}
-				e.limitModeQueue <- *jf
+				jf1 := jf.copy()
+				// logMsg2(true, fmt.Sprintf("f.eventListers :%v", jf1.eventListeners))
+				e.limitModeQueue <- jf1
 				time.Sleep(1 * time.Millisecond)
 			}
 		}
 	}
-	tr := time.AfterFunc(500*time.Millisecond, trf)
-	defer tr.Stop()
+	tr := time.NewTimer(800 * time.Millisecond)
+	go func() {
+		for {
+			select {
+			case <-tr.C:
+				if e.stopped.Load() {
+					return
+				}
+				trf()
+				tr.Reset(800 * time.Millisecond)
+			}
+		}
+	}()
+
+	// tr := time.AfterFunc(900*time.Millisecond, trf)
+	// defer tr.Stop()
 
 	for {
 		select {
 		case f := <-e.jobFunctions:
-			logMsg(" executor run. -> f := <-e.jobFunctions begin :" + f.jobName)
+			logMsg(" executor run. -> f := <-e.jobFunctions begin :" + f.jobName +
+				fmt.Sprintf("\n%v", f.eventListeners))
 
 			if e.stopped.Load() || e.skipExecution.Load() {
 				continue

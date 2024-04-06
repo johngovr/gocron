@@ -607,7 +607,10 @@ func (s *Scheduler) run(job *Job) {
 	}
 
 	logMsg(" scheduler run :" + job.jobName + ", before put function copy to jobFunctions channel")
-	s.executor.jobFunctions <- job.jobFunction.copy()
+	jf1 := job.jobFunction.copy()
+	logMsg(fmt.Sprintf("run job :%s, eventlisteners :%v", job.jobName, job.eventListeners))
+	logMsg(fmt.Sprintf("run copy job:%s, eventlisteners :%v", jf1.jobName, jf1.eventListeners))
+	s.executor.jobFunctions <- jf1
 }
 
 func (s *Scheduler) runContinuous(job *Job) {
@@ -1468,9 +1471,13 @@ func (s *Scheduler) WaitForSchedule() *Scheduler {
 // for most jobs, but is useful for overriding the default
 // behavior of Cron scheduled jobs which default to
 // WaitForSchedule.
-func (s *Scheduler) StartImmediately() *Scheduler {
+func (s *Scheduler) StartImmediately(sibs ...bool) *Scheduler {
 	job := s.getCurrentJob()
-	job.startsImmediately = true
+	sib := true
+	if len(sibs) > 0 {
+		sib = sibs[0]
+	}
+	job.startsImmediately = sib
 	return s
 }
 
@@ -1542,6 +1549,12 @@ func (s *Scheduler) RegisterEventListeners(eventListeners ...EventListener) {
 		job.RegisterEventListeners(eventListeners...)
 	}
 }
+func (s *Scheduler) RegisterJobEvevntListeners(eventListeners ...EventListener) *Scheduler {
+	job := s.getCurrentJob()
+
+	job.RegisterEventListeners(eventListeners...)
+	return s
+}
 
 func (s *Scheduler) PauseJobExecution(shouldPause bool) {
 	s.executor.skipExecution.Store(shouldPause)
@@ -1563,6 +1576,27 @@ var logsync *sync.RWMutex = &sync.RWMutex{}
 
 func logMsg(msg string) {
 	return
+	logsync.RLock()
+	defer logsync.RUnlock()
+
+	fmt.Printf("%s %s\n", time.Now().Format("02 15:04:05.999"), msg)
+}
+
+func traceMsg2(msg string) func() {
+	logMsg2(true, " starting "+msg)
+	tn := time.Now()
+
+	return func() {
+		d1 := time.Now().Sub(tn)
+		logMsg2(true, " finish "+msg+" using "+fmt.Sprint(d1))
+	}
+
+}
+
+func logMsg2(t bool, msg string) {
+	if !t {
+		return
+	}
 	logsync.RLock()
 	defer logsync.RUnlock()
 
